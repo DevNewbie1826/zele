@@ -232,6 +232,24 @@ function icsEventToCalendarEvent(event: IcsEvent, calObj?: DAVCalendarObject): C
   }
 }
 
+/** Parse every event in the given calendar objects and return the one matching the requested id or uid. */
+function findEventInObjects(calObjects: DAVCalendarObject[], eventId: string): CalendarEvent | undefined {
+  for (const obj of calObjects) {
+    if (!obj.data) continue
+    const events = parseICalData(obj.data, obj)
+    if (events instanceof ParseError) continue // skip unparseable calendar objects
+    const match = events.find((e) => e.id === eventId || e.uid === eventId)
+    if (match) return match
+  }
+  return undefined
+}
+
+/** Build the CalDAV object href Google serves for a uid: `<calendar>/events/<url-encoded uid>.ics`. */
+function eventObjectUrl(calendar: DAVCalendar, eventId: string): string {
+  const base = calendar.url.endsWith('/') ? calendar.url : `${calendar.url}/`
+  return `${base}${encodeURIComponent(eventId)}.ics`
+}
+
 /** Parse all events from a raw iCal data string using ts-ics.
  *  Boundary: convertIcsCalendar (ts-ics library) may throw on malformed iCal.
  *  Returns ParseError on failure so callers can decide how to handle it. */
@@ -583,6 +601,25 @@ export class CalendarClient {
     const cal = await this.resolveCalendar(calendarId)
     if (cal instanceof Error) return cal
 
+    // Address the object directly: one multiget for its href instead of a list
+    // REPORT over the whole calendar plus a multiget of every object in it.
+    const objectUrl = eventObjectUrl(cal, eventId)
+    const direct = await caldavBoundary(this.email, () =>
+      fetchCalendarObjects({
+        calendar: cal,
+        headers: this.headers,
+        objectUrls: [objectUrl],
+      }),
+    )
+    if (direct instanceof AuthError) return direct
+    if (!(direct instanceof Error)) {
+      const match = findEventInObjects(direct, eventId)
+      if (match) return match
+    }
+
+    // Fall back to the whole-calendar scan when the uid is not addressable at
+    // its natural href (foreign filename shapes such as zele-created events)
+    // or when the direct read failed transiently.
     const calObjects = await caldavBoundary(this.email, () =>
       fetchCalendarObjects({
         calendar: cal,
@@ -592,13 +629,8 @@ export class CalendarClient {
     )
     if (calObjects instanceof Error) return calObjects
 
-    for (const obj of calObjects) {
-      if (!obj.data) continue
-      const events = parseICalData(obj.data, obj)
-      if (events instanceof ParseError) continue // skip unparseable calendar objects
-      const match = events.find((e) => e.id === eventId || e.uid === eventId)
-      if (match) return match
-    }
+    const fallbackMatch = findEventInObjects(calObjects, eventId)
+    if (fallbackMatch) return fallbackMatch
 
     return new NotFoundError({ resource: `event "${eventId}"` })
   }
